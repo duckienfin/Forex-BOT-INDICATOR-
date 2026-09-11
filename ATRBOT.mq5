@@ -4,7 +4,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Gemini Assistant"
 #property link      ""
-#property version   "1.08"
+#property version   "1.09"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -33,6 +33,11 @@ struct VirtualOrder
 input group "--- Cấu hình Khung Thời Gian ---"
 input ENUM_TIMEFRAMES InpTimeframe    = PERIOD_M5;   // Khung thời gian chạy thuật toán
 
+input group "--- Cấu hình Bộ lọc Xu hướng EMA (MỚI) ---"
+input bool             InpUseEMAFilter= true;        // Bật/Tắt lọc xu hướng theo EMA
+input int              InpEMAPeriod   = 200;         // Chu kỳ EMA (Mặc định EMA 200)
+input ENUM_APPLIED_PRICE InpEMAPrice  = PRICE_CLOSE; // Giá áp dụng cho EMA
+
 input group "--- Cấu hình Bộ lọc Biến động ATR ---"
 input int      InpATRPeriod           = 14;          // Chu kỳ ATR
 input bool     InpUseMinATR           = true;        // Bật/Tắt kiểm tra ATR Tối thiểu
@@ -40,22 +45,22 @@ input double   InpMinATRValue         = 0.0005;      // Giá trị ATR tối thi
 input bool     InpUseMaxATR           = true;        // Bật/Tắt kiểm tra ATR Tối đa
 input double   InpMaxATRValue         = 0.0030;      // Giá trị ATR tối đa
 
-input group "--- Cấu hình Biên Độ Dao Động ATR (MỚI) ---"
+input group "--- Cấu hình Biên Độ Dao Động ATR ---"
 input bool     InpUseATRRangeFilter   = true;        // Bật/Tắt kiểm tra biên độ ATR trong N nến
 input int      InpATRRangeBars        = 20;          // Số cây nến xét biên độ dao động ATR
-input double   InpMaxATRRatio         = 1.5;         // Tỷ lệ ATR Max / ATR Min tối đa cho phép (Ví dụ: 1.5 = ATR không biến động quá 50%)
+input double   InpMaxATRRatio         = 1.5;         // Tỷ lệ ATR Max / ATR Min tối đa cho phép
 
 input group "--- Cấu hình Nến Breakout ---"
 input bool     InpUseMinBodyFilter    = true;        // Bật/Tắt lọc kích thước thân nến Breakout
-input double   InpMinBody_ATR_Mult    = 1.2;         // Thân nến Breakout tối thiểu theo hệ số ATR (|Close - Open| >= Mult * ATR)
+input double   InpMinBody_ATR_Mult    = 1.2;         // Thân nến Breakout tối thiểu theo hệ số ATR
 
 input group "--- Cấu hình Vùng Range & Breakout ---"
 input int      InpRangeBars           = 12;          // Số cây nến tích lũy tạo vùng Range
 input ulong    InpSlippage            = 10;          // Độ trượt giá tối đa (Slippage)
 
 input group "--- Cấu hình Fibonacci & Lệnh Chờ Ảo ---"
-input double   InpFiboLevel           = 0.50;        // Mức Fibo hồi quy (0.50 = 50%, 0.618 = 61.8%)
-input int      InpPendingExpireBars   = 6;           // Thời gian hết hạn lệnh chờ ảo (Số nến M5)
+input double   InpFiboLevel           = 0.50;        // Mức Fibo hồi quy (0.50 = 50%)
+input int      InpPendingExpireBars   = 6;           // Thời gian hết hạn lệnh chờ ảo (Số nến)
 input bool     InpUseCancelByATR      = true;        // Bật/Tắt Hủy Lệnh Ảo khi giá đã đi xa theo hướng TP
 input double   InpCancelTP_ATR_Mult   = 1.2;         // Khoảng cách ATR giá đã chạm trước để HỦY lệnh ảo
 
@@ -78,6 +83,7 @@ input double   InpNewTP_Loss_ATR_Mult = 0.3;         // Mức TP mới chấp nh
 //--- GLOBAL VARIABLES
 CTrade         trade;
 int            handleATR;
+int            handleEMA;
 datetime       lastBarTime;
 VirtualOrder   vOrder;
 
@@ -89,10 +95,19 @@ int OnInit()
    trade.SetExpertMagicNumber(InpMagicNumber);
    trade.SetDeviationInPoints(InpSlippage);
 
+   // Khởi tạo Handle ATR
    handleATR = iATR(_Symbol, InpTimeframe, InpATRPeriod);
    if(handleATR == INVALID_HANDLE)
      {
       Print("Lỗi khởi tạo chỉ báo ATR!");
+      return(INIT_FAILED);
+     }
+
+   // Khởi tạo Handle EMA
+   handleEMA = iMA(_Symbol, InpTimeframe, InpEMAPeriod, 0, MODE_EMA, InpEMAPrice);
+   if(handleEMA == INVALID_HANDLE)
+     {
+      Print("Lỗi khởi tạo chỉ báo EMA!");
       return(INIT_FAILED);
      }
 
@@ -106,8 +121,8 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
   {
-   if(handleATR != INVALID_HANDLE)
-      IndicatorRelease(handleATR);
+   if(handleATR != INVALID_HANDLE) IndicatorRelease(handleATR);
+   if(handleEMA != INVALID_HANDLE) IndicatorRelease(handleEMA);
   }
 
 //+------------------------------------------------------------------+
@@ -125,21 +140,19 @@ void OnTick()
    datetime currentBarTime = iTime(_Symbol, InpTimeframe, 0);
    if(currentBarTime == lastBarTime) return;
 
-   // Mảng chứa dữ liệu ATR
+   // Lấy dữ liệu ATR
    double atrValues[];
    ArraySetAsSeries(atrValues, true);
-   
-   // Đọc số lượng ATR nến cần lấy để lọc biên độ
    int barsToCopy = MathMax(1, InpATRRangeBars);
    if(CopyBuffer(handleATR, 0, 1, barsToCopy, atrValues) < barsToCopy) return;
 
    double currentATR = atrValues[0]; // ATR nến index 1
 
-   // --- LỌC ATR TỐI THIỂU VÀ TỐI ĐA CƠ BẢN ---
+   // Lọc ATR tối thiểu & tối đa
    if(InpUseMinATR && currentATR < InpMinATRValue) return; 
    if(InpUseMaxATR && currentATR > InpMaxATRValue) return; 
 
-   // --- LỌC BIÊN ĐỘ DAO ĐỘNG ATR TRONG N NẾN (MỚI) ---
+   // Lọc Biên độ dao động ATR trong N nến
    if(InpUseATRRangeFilter && barsToCopy > 1)
      {
       double maxATR = atrValues[0];
@@ -151,16 +164,26 @@ void OnTick()
          if(atrValues[i] < minATR) minATR = atrValues[i];
         }
 
-      if(minATR > 0)
-        {
-         double atrRatio = maxATR / minATR;
-         if(atrRatio > InpMaxATRRatio)
-           {
-            // Bỏ qua vì biên độ ATR biến động quá mạnh/không ổn định trong N nến qua
-            return;
-           }
-        }
+      if(minATR > 0 && (maxATR / minATR) > InpMaxATRRatio) return;
      }
+
+   // Lấy dữ liệu EMA tại nến index 1 (nến vừa đóng cửa)
+   double emaValues[];
+   ArraySetAsSeries(emaValues, true);
+   if(CopyBuffer(handleEMA, 0, 1, 1, emaValues) <= 0) return;
+   double currentEMA = emaValues[0];
+
+   // Lấy thông tin nến Breakout (index 1)
+   MqlRates breakBar[];
+   ArraySetAsSeries(breakBar, true);
+   if(CopyRates(_Symbol, InpTimeframe, 1, 1, breakBar) <= 0) return;
+
+   double breakClose = breakBar[0].close;
+   double breakOpen  = breakBar[0].open;
+   double candleBody = MathAbs(breakClose - breakOpen);
+
+   // Lọc kích thước thân nến Breakout
+   if(InpUseMinBodyFilter && candleBody < (currentATR * InpMinBody_ATR_Mult)) return;
 
    // Xác định vùng Range
    MqlRates rates[];
@@ -180,26 +203,13 @@ void OnTick()
       if(bodyMin < rangeLow)  rangeLow  = bodyMin;
      }
 
-   // Thông tin nến Breakout
-   MqlRates breakBar[];
-   ArraySetAsSeries(breakBar, true);
-   if(CopyRates(_Symbol, InpTimeframe, 1, 1, breakBar) <= 0) return;
-
-   double breakClose = breakBar[0].close;
-   double breakOpen  = breakBar[0].open;
-   double candleBody = MathAbs(breakClose - breakOpen);
-
-   // --- LỌC KÍCH THƯỚC THÂN NẾN BREAKOUT ---
-   if(InpUseMinBodyFilter)
-     {
-      double minRequiredBody = currentATR * InpMinBody_ATR_Mult;
-      if(candleBody < minRequiredBody) return;
-     }
-
    if(HasOpenPosition() || vOrder.active) return;
 
-   // --- THIẾT LẬP LỆNH CHỜ ẢO BUY ---
-   if(breakClose > rangeHigh && breakClose > breakOpen)
+   // --- THIẾT LẬP LỆNH CHỜ ẢO BUY (ĐIỀU KIỆN MỚI: NẰM TRÊN EMA) ---
+   bool isBuyBreakout = (breakClose > rangeHigh && breakClose > breakOpen);
+   bool isEMABullish  = (!InpUseEMAFilter || (breakClose > currentEMA));
+
+   if(isBuyBreakout && isEMABullish)
      {
       double breakHigh = breakBar[0].high; 
       
@@ -219,11 +229,14 @@ void OnTick()
       vOrder.active      = true;
 
       lastBarTime = currentBarTime;
-      Print("-> Tạo Lệnh Chờ Ảo BUY LIMIT tại: ", limitPrice, " | Mức Hủy Ảo: ", cancelPrice);
+      Print("-> [BUY] Breakout trên EMA ", InpEMAPeriod, " (Giá: ", breakClose, " > EMA: ", currentEMA, "). Tạo Limit tại: ", limitPrice);
      }
 
-   // --- THIẾT LẬP LỆNH CHỜ ẢO SELL ---
-   else if(breakClose < rangeLow && breakClose < breakOpen)
+   // --- THIẾT LẬP LỆNH CHỜ ẢO SELL (ĐIỀU KIỆN MỚI: NẰM DƯỚI EMA) ---
+   bool isSellBreakout = (breakClose < rangeLow && breakClose < breakOpen);
+   bool isEMABearish   = (!InpUseEMAFilter || (breakClose < currentEMA));
+
+   if(isSellBreakout && isEMABearish)
      {
       double breakLow = breakBar[0].low;
 
@@ -243,7 +256,7 @@ void OnTick()
       vOrder.active      = true;
 
       lastBarTime = currentBarTime;
-      Print("-> Tạo Lệnh Chờ Ảo SELL LIMIT tại: ", limitPrice, " | Mức Hủy Ảo: ", cancelPrice);
+      Print("-> [SELL] Breakout dưới EMA ", InpEMAPeriod, " (Giá: ", breakClose, " < EMA: ", currentEMA, "). Tạo Limit tại: ", limitPrice);
      }
   }
 
@@ -254,7 +267,6 @@ void ProcessVirtualOrder()
   {
    if(!vOrder.active) return;
 
-   // 1. Kiểm tra hết hạn lệnh chờ ảo
    if(TimeCurrent() >= vOrder.expiration)
      {
       Print("HỦY LỆNH ẢO: Lệnh đã hết thời gian chờ!");
@@ -265,12 +277,11 @@ void ProcessVirtualOrder()
    double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
-   // --- THIẾT LẬP LỆNH ẢO BUY ---
    if(vOrder.type == VIRTUAL_BUY)
      {
       if(InpUseCancelByATR && currentBid >= vOrder.cancelPrice)
         {
-         Print("HỦY LỆNH ẢO BUY: Giá đã đâm tới ngưỡng ATR (", vOrder.cancelPrice, ") trước khi quay lại!");
+         Print("HỦY LỆNH ẢO BUY: Giá đã chạm ngưỡng ATR hủy lệnh (", vOrder.cancelPrice, ") trước khi hồi!");
          ResetVirtualOrder();
          return;
         }
@@ -285,12 +296,11 @@ void ProcessVirtualOrder()
         }
      }
 
-   // --- THIẾT LẬP LỆNH ẢO SELL ---
    else if(vOrder.type == VIRTUAL_SELL)
      {
       if(InpUseCancelByATR && currentAsk <= vOrder.cancelPrice)
         {
-         Print("HỦY LỆNH ẢO SELL: Giá đã đâm tới ngưỡng ATR (", vOrder.cancelPrice, ") trước khi quay lại!");
+         Print("HỦY LỆNH ẢO SELL: Giá đã chạm ngưỡng ATR hủy lệnh (", vOrder.cancelPrice, ") trước khi hồi!");
          ResetVirtualOrder();
          return;
         }
